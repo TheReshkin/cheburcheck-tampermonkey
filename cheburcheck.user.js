@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cheburcheck: проверка сайта в списках ТСПУ
 // @namespace    https://github.com/TheReshkin/cheburcheck-tampermonkey
-// @version      0.2.0
-// @description  Проверяет, заблокирован ли домен текущего сайта (списки + динамическая проверка сканерами ТСПУ), через https://cheburcheck.ru/ (запуск вручную из меню Tampermonkey).
+// @version      0.3.0
+// @description  Проверяет, заблокирован ли домен текущего сайта и его сторонние домены (списки + динамическая проверка сканерами ТСПУ), через https://cheburcheck.ru/. Запуск вручную из меню Tampermonkey.
 // @author       TheReshkin
 // @license      MIT
 // @homepageURL  https://github.com/TheReshkin/cheburcheck-tampermonkey
@@ -15,8 +15,10 @@
 // @connect      cheburcheck.ru
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @noframes
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -27,10 +29,70 @@
   const SITE = 'https://cheburcheck.ru/check?target=';
   const HOST_ID = 'cheburcheck-tm-badge';
   const PROBE_TIMEOUT_MS = 90000;
+  const CONCURRENCY = 2;          // сколько доменов проверяем одновременно
+  const MAX_DOMAINS = 40;         // потолок на один запуск
+  const CACHE_TTL_MS = 3 * 60 * 60 * 1000;
+  const RETRY_DELAYS_MS = [8000, 20000, 40000]; // при ответе 429
+
+  // ---------------------------------------------------------------------------
+  // Сбор доменов, к которым обращалась страница (ничего никуда не отправляется).
+  // Запускаемся на document-start, чтобы PerformanceObserver увидел ранние запросы.
+  // ---------------------------------------------------------------------------
+
+  const seenHosts = new Set();
+
+  function addHostFromUrl(url) {
+    try {
+      const u = new URL(url, location.href);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+      seenHosts.add(u.hostname.toLowerCase());
+    } catch (e) { /* игнорируем */ }
+  }
+
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) addHostFromUrl(e.name);
+    }).observe({ type: 'resource', buffered: true });
+  } catch (e) { /* PerformanceObserver недоступен — соберём из getEntriesByType при запуске */ }
 
   /** Домен текущей страницы без ведущего "www." */
   function currentDomain() {
     return location.hostname.replace(/^www\./i, '').toLowerCase();
+  }
+
+  const SECOND_LEVEL = new Set(['co', 'com', 'net', 'org', 'gov', 'edu', 'ac', 'msk', 'spb']);
+
+  /** Грубая оценка "основного" домена (без публичного списка суффиксов). */
+  function baseDomain(host) {
+    const parts = host.split('.');
+    if (parts.length <= 2) return host;
+    const take = SECOND_LEVEL.has(parts[parts.length - 2]) && parts[parts.length - 1].length === 2 ? 3 : 2;
+    return parts.slice(-take).join('.');
+  }
+
+  function isIp(host) {
+    return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
+  }
+
+  /** Сторонние домены: не наш основной домен, не IP, не localhost. */
+  function collectThirdParty() {
+    try {
+      for (const e of performance.getEntriesByType('resource')) addHostFromUrl(e.name);
+    } catch (e) { /* нет API */ }
+    const own = baseDomain(currentDomain());
+    return [...seenHosts]
+      .filter((h) => h.includes('.') && !isIp(h) && baseDomain(h) !== own)
+      .sort();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Работа с API cheburcheck.ru
+  // ---------------------------------------------------------------------------
+
+  function httpError(message, status) {
+    const err = new Error(message);
+    err.status = status;
+    return err;
   }
 
   /** Статическая проверка (GET /api/v1/check?target=...), как на сайте. */
@@ -46,11 +108,11 @@
             try { resolve(JSON.parse(res.responseText)); }
             catch (e) { reject(new Error('Некорректный ответ сервера')); }
           } else if (res.status === 404) {
-            reject(new Error('Домен не найден (не удалось определить)'));
+            reject(httpError('Домен не найден (не удалось определить)', 404));
           } else if (res.status === 429) {
-            reject(new Error('Слишком много запросов, попробуйте позже'));
+            reject(httpError('Слишком много запросов, попробуйте позже', 429));
           } else {
-            reject(new Error('HTTP ' + res.status));
+            reject(httpError('HTTP ' + res.status, res.status));
           }
         },
         onerror() { reject(new Error('Ошибка сети')); },
@@ -153,7 +215,7 @@
         timeout: PROBE_TIMEOUT_MS,
         onprogress(res) { consume(res.responseText || ''); },
         onload(res) {
-          if (res.status !== 200) return finish(new Error('HTTP ' + res.status));
+          if (res.status !== 200) return finish(httpError('HTTP ' + res.status, res.status));
           consume(res.responseText || '');
           finish();
         },
@@ -163,11 +225,85 @@
     });
   }
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** Повторяет операцию при HTTP 429 с растущей паузой. */
+  async function withRetry(fn) {
+    for (let i = 0; ; i++) {
+      try {
+        return await fn();
+      } catch (e) {
+        if (e.status !== 429 || i >= RETRY_DELAYS_MS.length) throw e;
+        await sleep(RETRY_DELAYS_MS[i]);
+      }
+    }
+  }
+
+  /**
+   * Полная проверка домена: списки, затем (если не найден) динамическая проверка.
+   * Возвращает { kind, label, text, info, probes, online, done, blocked }.
+   * kind: 'ok' | 'bad' | 'warn' | 'err'.
+   */
+  async function checkDomain(domain, onProgress) {
+    const r = await withRetry(() => fetchCheck(domain));
+    const info = [];
+    if (r.rkn_domain) info.push('Запись в реестре: ' + r.rkn_domain);
+    if (r.blocked_subnets && r.blocked_subnets.length) {
+      info.push('Заблокированные подсети: ' + r.blocked_subnets.length);
+    }
+    const cdns = Object.keys(r.cdn_providers || {});
+    if (cdns.length) info.push('CDN: ' + cdns.join(', '));
+
+    // Как на сайте: вердикт сканеров главнее списков, списки — запасной вариант.
+    // (Статический blocked=true бывает и у доменов за заблокированным CDN, которые сканеры считают доступными.)
+    const staticFallback = (note) => r.blocked
+      ? { kind: 'bad', icon: '🚫', label: 'заблокирован', text: 'Найден в списках блокировок. ' + note, info, partial: true }
+      : { kind: 'err', icon: '❔', label: 'вердикт не определён', text: note, info, partial: true };
+
+    if (!r.id) return staticFallback('Сервер не вернул id динамической проверки');
+
+    let res;
+    try {
+      res = await withRetry(() => runProbes(r.id, onProgress || (() => {})));
+    } catch (e) {
+      if (e.status === 429) throw e;
+      return staticFallback('Динамическая проверка не удалась: ' + e.message);
+    }
+    const verdict = selectVerdict(res.probes, cdns.length > 0);
+    const counts = res.probes.length + (res.online ? ' из ' + res.online : '') + ' сканеров';
+    const partial = !res.done;
+
+    if (!verdict) return staticFallback('Сканеры не дали вердикта (' + counts + ')');
+    const v = VERDICTS[verdict];
+    return { kind: v.kind, icon: v.icon, label: v.title, text: v.text + '. ' + counts, info, partial };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Кэш результатов (только завершённые, без ошибок)
+  // ---------------------------------------------------------------------------
+
+  function cacheGet(domain) {
+    try {
+      const e = GM_getValue('cc:' + domain, null);
+      if (e && Date.now() - e.t < CACHE_TTL_MS) return e.res;
+    } catch (err) { /* нет кэша */ }
+    return null;
+  }
+
+  function cacheSet(domain, res) {
+    if (res.kind === 'err' || res.partial) return;
+    try { GM_setValue('cc:' + domain, { t: Date.now(), res }); } catch (err) { /* ignore */ }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Плашка
+  // ---------------------------------------------------------------------------
+
   const STYLES = `
     :host { all: initial; }
     .box {
       position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
-      max-width: 340px; padding: 10px 12px; border-radius: 8px;
+      width: max-content; max-width: 360px; padding: 10px 12px; border-radius: 8px;
       font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
       color: #fff; background: #374151; box-shadow: 0 4px 16px rgba(0,0,0,.35);
     }
@@ -177,6 +313,10 @@
     .box.err { background: #4b5563; }
     .title { font-weight: 600; padding-right: 18px; }
     .meta { margin-top: 4px; opacity: .9; font-size: 12px; }
+    .list { margin-top: 8px; max-height: 40vh; overflow-y: auto; font-size: 12px; }
+    .row { display: flex; gap: 6px; padding: 2px 0; align-items: baseline; }
+    .row .d { flex: 1; word-break: break-all; }
+    .row .s { opacity: .9; white-space: nowrap; }
     a { color: #fff; text-decoration: underline; }
     button {
       all: unset; cursor: pointer; position: absolute; top: 6px; right: 8px;
@@ -190,8 +330,11 @@
     if (old) old.remove();
   }
 
-  /** Плашка со статусом. kind: '' | 'ok' | 'bad' | 'warn' | 'err' */
-  function showBadge(kind, title, meta, domain) {
+  /**
+   * Плашка со статусом. kind: '' | 'ok' | 'bad' | 'warn' | 'err'.
+   * rows (необязательно): [{ domain, icon, status }] — список доменов.
+   */
+  function showBadge(kind, title, meta, domain, rows) {
     removeBadge();
     const host = document.createElement('div');
     host.id = HOST_ID;
@@ -219,6 +362,30 @@
       m.textContent = meta;
       box.append(m);
     }
+
+    if (rows && rows.length) {
+      const list = document.createElement('div');
+      list.className = 'list';
+      for (const r of rows) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        const ic = document.createElement('span');
+        ic.textContent = r.icon;
+        const d = document.createElement('a');
+        d.className = 'd';
+        d.href = SITE + encodeURIComponent(r.domain);
+        d.target = '_blank';
+        d.rel = 'noopener noreferrer';
+        d.textContent = r.domain;
+        const s = document.createElement('span');
+        s.className = 's';
+        s.textContent = r.status;
+        row.append(ic, d, s);
+        list.append(row);
+      }
+      box.append(list);
+    }
+
     if (domain) {
       const l = document.createElement('div');
       l.className = 'meta';
@@ -235,8 +402,13 @@
     (document.body || document.documentElement).append(host);
   }
 
+  // ---------------------------------------------------------------------------
+  // Команды меню
+  // ---------------------------------------------------------------------------
+
   let running = false;
 
+  /** Проверка домена текущего сайта. */
   async function runCheck() {
     if (running) return;
     const domain = currentDomain();
@@ -244,44 +416,14 @@
     running = true;
     showBadge('', 'Проверяю ' + domain + '…', 'Статическая проверка по спискам');
     try {
-      const r = await fetchCheck(domain);
-      const info = [];
-      if (r.rkn_domain) info.push('Запись в реестре: ' + r.rkn_domain);
-      if (r.blocked_subnets && r.blocked_subnets.length) {
-        info.push('Заблокированные подсети: ' + r.blocked_subnets.length);
-      }
-      const cdns = Object.keys(r.cdn_providers || {});
-      if (cdns.length) info.push('CDN: ' + cdns.join(', '));
-
-      // Найден в списках — динамическая проверка не нужна.
-      if (r.blocked) {
-        showBadge('bad', '🚫 ' + domain + ': заблокирован',
-          ['Найден в списках блокировок'].concat(info).join(' · '), domain);
-        return;
-      }
-      if (!r.id) {
-        showBadge('err', '⚠ ' + domain + ': динамическая проверка недоступна',
-          'В списках не найден, но сервер не вернул id проверки', domain);
-        return;
-      }
-
-      // Динамическая проверка сканерами: ждём все ответы и итоговый вердикт.
-      showBadge('', 'Проверяю ' + domain + '…', 'Динамическая проверка: ожидаю сканеры…');
-      const res = await runProbes(r.id, (probes, online) => {
+      const res = await checkDomain(domain, (probes, online) => {
         showBadge('', 'Проверяю ' + domain + '…',
           'Динамическая проверка: ответили ' + probes.length + (online ? ' из ' + online : '') + ' сканеров…');
       });
-
-      const verdict = selectVerdict(res.probes, cdns.length > 0);
-      const tail = [res.probes.length + (res.online ? ' из ' + res.online : '') + ' сканеров'].concat(info);
-      if (!res.done) tail.push('проверка завершена не полностью');
-
-      if (!verdict) {
-        showBadge('err', '❔ ' + domain + ': вердикт не определён', tail.join(' · '), domain);
-      } else {
-        const v = VERDICTS[verdict];
-        showBadge(v.kind, v.icon + ' ' + domain + ': ' + v.title, v.text + '. ' + tail.join(' · '), domain);
-      }
+      cacheSet(domain, res);
+      const tail = [res.text].concat(res.info);
+      if (res.partial) tail.push('проверка завершена не полностью');
+      showBadge(res.kind, res.icon + ' ' + domain + ': ' + res.label, tail.join(' · '), domain);
     } catch (e) {
       showBadge('err', '⚠ Не удалось проверить ' + domain, e.message, domain);
     } finally {
@@ -289,5 +431,85 @@
     }
   }
 
+  const KIND_ORDER = { bad: 0, warn: 1, err: 2, ok: 3 };
+
+  /** Проверка сторонних доменов, к которым обращалась страница. */
+  async function runCheckThirdParty() {
+    if (running) return;
+    let domains = collectThirdParty();
+    if (!domains.length) {
+      showBadge('err', 'Сторонних доменов не найдено',
+        'Страница пока не обращалась к другим доменам (или они не видны скрипту).');
+      return;
+    }
+    const truncated = domains.length > MAX_DOMAINS;
+    domains = domains.slice(0, MAX_DOMAINS);
+
+    running = true;
+    const results = new Map();   // domain -> результат или { kind: 'err', ... }
+    const pending = new Set(domains);
+    let doneCount = 0;
+
+    const render = () => {
+      const rows = domains.map((d) => {
+        const r = results.get(d);
+        if (r) return { domain: d, icon: r.icon || '⚠', status: r.label, kind: r.kind };
+        return { domain: d, icon: '⏳', status: pending.has(d) ? 'ожидает' : 'проверяется…', kind: 'pending' };
+      });
+      const order = (x) => (x.kind === 'pending' ? 4 : KIND_ORDER[x.kind] ?? 2);
+      rows.sort((a, b) => order(a) - order(b) || a.domain.localeCompare(b.domain));
+
+      const all = [...results.values()];
+      const bad = all.filter((r) => r.kind === 'bad').length;
+      const warn = all.filter((r) => r.kind === 'warn').length;
+      const err = all.filter((r) => r.kind === 'err').length;
+      const finished = doneCount === domains.length;
+
+      const parts = [];
+      if (bad) parts.push('заблокировано: ' + bad);
+      if (warn) parts.push('особые: ' + warn);
+      if (err) parts.push('не проверено: ' + err);
+      const summary = parts.length ? parts.join(', ') : (finished ? 'ограничений не найдено' : '');
+
+      const kind = !finished ? '' : bad ? 'bad' : (warn || err) ? 'warn' : 'ok';
+      const title = (finished ? 'Сторонние домены: ' : 'Проверено ' + doneCount + ' из ' + domains.length + ' · ') +
+        (summary || 'идёт проверка…');
+      const meta = (truncated ? 'Показаны первые ' + MAX_DOMAINS + ' доменов. ' : '') +
+        (finished ? '' : 'Каждый домен проверяется до ~минуты, подождите.');
+      showBadge(kind, title, meta, null, rows);
+    };
+
+    render();
+
+    const queue = domains.slice();
+    const worker = async () => {
+      for (;;) {
+        const d = queue.shift();
+        if (!d) return;
+        pending.delete(d);
+        render();
+        let res = cacheGet(d);
+        if (!res) {
+          try {
+            res = await checkDomain(d);
+            cacheSet(d, res);
+          } catch (e) {
+            res = { kind: 'err', icon: '⚠', label: e.message, text: e.message, info: [] };
+          }
+        }
+        results.set(d, res);
+        doneCount++;
+        render();
+      }
+    };
+
+    try {
+      await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+    } finally {
+      running = false;
+    }
+  }
+
   GM_registerMenuCommand('Проверить этот сайт на cheburcheck.ru', runCheck);
+  GM_registerMenuCommand('Проверить сторонние домены сайта', runCheckThirdParty);
 })();
